@@ -36,12 +36,12 @@ class HMMRegimeDetector:
     random_state     : for reproducibility
     """
 
-    def __init__(self, n_states=3, covariance_type="full",
+    def __init__(self, n_states=3, covariance_type="diag",
                  n_iter=200, random_state=42):
         self.n_states  = n_states
         self.hmm_      = GaussianHMM(
             n_components    = n_states,
-            covariance_type = covariance_type,
+            covariance_type = "diag",   # stable on real financial data
             n_iter          = n_iter,
             random_state    = random_state,
             init_params     = 'stmc',
@@ -80,7 +80,24 @@ class HMMRegimeDetector:
         from sklearn.preprocessing import StandardScaler
         self._obs_scaler = StandardScaler()
         X = self._obs_scaler.fit_transform(X)
-        self.hmm_.fit(X)
+        # Multi-start EM: try 5 seeds, keep highest log-likelihood
+        from hmmlearn.hmm import GaussianHMM as _G
+        best_score, best_hmm = -1e18, None
+        for seed in [42, 7, 13, 99, 21]:
+            try:
+                h = _G(n_components=self.n_states, covariance_type="diag",
+                       n_iter=self.hmm_.n_iter, random_state=seed,
+                       init_params="stmc", params="stmc")
+                h.fit(X)
+                s = h.score(X)
+                if s > best_score:
+                    best_score, best_hmm = s, h
+            except Exception:
+                continue
+        if best_hmm is not None:
+            self.hmm_ = best_hmm
+        else:
+            self.hmm_.fit(X)
         states_raw = self.hmm_.predict(X)
         self.posteriors_ = pd.DataFrame(
             self.hmm_.predict_proba(X),
@@ -88,15 +105,20 @@ class HMMRegimeDetector:
             columns = [f"P_state_{i}" for i in range(self.n_states)]
         )
 
-        # ── Label states by mean return ───────────────────────────
-        state_means = {
-            s: X[states_raw == s, 0].mean()
+        # ── Label states by volatility (column 1 = vol_20) ─────
+        # Volatility-based labelling is more robust than return-based
+        # on samples where all regimes show positive mean returns.
+        # Low vol = Bull (calm trending), Mid vol = Bear (uncertain),
+        # High vol = Crisis (panic/shock events)
+        state_vols = {
+            s: X[states_raw == s, 1].mean()
             for s in range(self.n_states)
         }
-        sorted_states = sorted(state_means, key=lambda s: state_means[s])
-        labels        = ["crisis", "bear", "bull"]
-        self.label_map_ = {s: labels[i]
-                           for i, s in enumerate(sorted_states)}
+        sorted_by_vol = sorted(state_vols, key=lambda s: state_vols[s])
+        # Lowest vol → Bull, Mid vol → Bear, Highest vol → Crisis
+        vol_labels = ["bull", "bear", "crisis"]
+        self.label_map_ = {s: vol_labels[i]
+                           for i, s in enumerate(sorted_by_vol)}
 
         self.regime_series_ = pd.Series(
             [self.label_map_[s] for s in states_raw],

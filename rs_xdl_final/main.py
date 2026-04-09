@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  RS-XDL: REGIME-SWITCHING EXPLAINABLE DEEP LEARNING                     ║
+║  RS-XDL: REGIME-SWITCHING EXPLAINABLE DEEP LEARNING                      ║
 ║  Indian Equity Markets — Complete Research Pipeline                      ║
 ║                                                                          ║
 ║  Author  : Mahendran Sundarapandiyan                                     ║
 ║  Institute: Alliance University, Bangalore                               ║
-║  Target  : Expert Systems with Applications (Elsevier Q1, IF ~8.5)      ║
+║  Target  : Expert Systems with Applications (Elsevier Q1, IF ~8.5)       ║
 ║                                                                          ║
 ║  IMPORTANT: This pipeline uses REAL NSE data only.                       ║
 ║  Run data_loader.py first to download data:                              ║
@@ -44,6 +44,7 @@ from feature_engineering  import build_features, get_feature_groups
 from hmm_regime           import HMMRegimeDetector, REGIMES, REGIME_COLORS
 from rc_shap              import RCShap
 from evaluation           import (forecast_metrics, dm_test_suite,
+                                   dm_test_suite_full, diebold_mariano_directional,
                                    portfolio_metrics, aggregate_folds)
 
 import shap
@@ -190,7 +191,12 @@ for fold_idx, (tr_sl, te_sl) in enumerate(folds):
     # ── RC-SHAP per regime ────────────────────────────────────────
     rc = RCShap(xgb_m, FEAT_COLS)
     rc.fit(X_te_s, reg_te.values, sample_size=min(400, len(X_te_s)))
-    rc.kruskal_wallis_test()
+    try:
+        rc.kruskal_wallis_test()
+    except Exception as _e:
+        print(f"  ⚠️  KW skipped fold {fold_idx+1}: {_e}")
+        rc.kw_results_ = pd.DataFrame(
+            columns=["feature","H_stat","p_value","sig"])
 
     # ── Collect metrics ───────────────────────────────────────────
     fold_metrics = [
@@ -232,14 +238,14 @@ arima_agg = np.concatenate([r["arima_p"] for r in all_fold_results])
 naive_agg = np.concatenate([r["naive_p"] for r in all_fold_results])
 ridge_agg = np.concatenate([r["ridge_p"] for r in all_fold_results])
 
-dm_df = dm_test_suite(
+dm_df = dm_test_suite_full(
     y_agg,
     {"XGBoost": xgb_agg, "ARIMA": arima_agg,
      "Naive": naive_agg, "Ridge": ridge_agg},
     proposed="XGBoost"
 )
-print(dm_df[["XGBoost vs", "DM_stat", "p_value", "sig"]].to_string(
-    index=False))
+print(dm_df[["XGBoost vs","DM_MSE","p_MSE","sig_MSE",
+             "DM_Dir","p_Dir","sig_Dir"]].to_string(index=False))
 dm_df.to_csv("outputs/tables/table3_diebold_mariano.csv", index=False)
 
 # ════════════════════════════════════════════════════════════════════
@@ -267,62 +273,76 @@ for reg in REGIMES:
         df_s.to_csv(f"outputs/tables/table2_shap_{reg}.csv", index=False)
 
 sig_feats = rc_global.significant_features()
-sig_feats.to_csv("outputs/tables/table4_kruskal_wallis.csv", index=False)
-print(f"  Significant regime SHAP shifts: "
-      f"{len(sig_feats)}/{len(rc_global.kw_results_)} features (p<0.05)")
+if not sig_feats.empty:
+    sig_feats.to_csv("outputs/tables/table4_kruskal_wallis.csv", index=False)
+total_kw = len(rc_global.kw_results_) if rc_global.kw_results_ is not None else 0
+print(f"  Significant regime SHAP shifts: {len(sig_feats)}/{total_kw} features (p<0.05)")
 
 # ════════════════════════════════════════════════════════════════════
 # [8] SHAP-GUIDED PORTFOLIO
 # ════════════════════════════════════════════════════════════════════
-print("\n[8/9] SHAP-guided portfolio construction ...")
+print("\n[8/9] Regime-conditioned SHAP portfolio construction ...")
 
 PORTFOLIO_STOCKS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
 
+# ── Pre-compute stable regime-level RC-SHAP weights ───────────────────
+# Using regime-conditioned SHAP importance (not prediction-level noise)
+regime_weights = {}
+for reg in REGIMES:
+    df_s = rc_global.regime_shap_.get(reg, pd.DataFrame())
+    if df_s.empty or "mean_shap_raw" not in df_s.columns:
+        regime_weights[reg] = {s: 1.0/len(PORTFOLIO_STOCKS)
+                               for s in PORTFOLIO_STOCKS}
+        continue
+    w = {}
+    for stk in PORTFOLIO_STOCKS:
+        fn  = f"ret_{stk}"
+        row = df_s[df_s["feature"] == fn]
+        w[stk] = (float(row["mean_shap_raw"].values[0])
+                  if len(row) > 0 else 1e-4)
+    total = sum(w.values()) + 1e-9
+    regime_weights[reg] = {s: v/total for s, v in w.items()}
+    print(f"  RC-SHAP {reg.upper()} weights: " +
+          "  ".join(f"{s}={v:.3f}" for s, v in regime_weights[reg].items()))
+
 port_records = []
 for fold_res in all_fold_results:
-    sv     = fold_res["shap_vals"]
-    dates  = fold_res["dates"]
-    regs   = fold_res["regime"].values
+    dates = fold_res["dates"]
+    regs  = fold_res["regime"].values
 
     for i in range(len(dates) - 1):
-        d      = dates[i]
-        d_next = dates[i + 1]
+        d, d_next = dates[i], dates[i + 1]
+        reg_now   = regs[i] if i < len(regs) else "bear"
+        w         = regime_weights.get(reg_now,
+                      {s: 1.0/len(PORTFOLIO_STOCKS)
+                       for s in PORTFOLIO_STOCKS})
 
-        # SHAP weight per stock
-        w = {}
-        for stk in PORTFOLIO_STOCKS:
-            fn = f"ret_{stk}"
-            if fn in FEAT_COLS:
-                fi   = FEAT_COLS.index(fn)
-                w[stk] = abs(sv[i, fi])
-            else:
-                w[stk] = 1.0
-        total = sum(w.values()) + 1e-9
-        w     = {s: v / total for s, v in w.items()}
-
-        # Actual next-day returns
         day_ret = {}
         for stk in PORTFOLIO_STOCKS:
             if (stk in raw_df.columns and
                     d in raw_df.index and d_next in raw_df.index):
-                day_ret[stk] = np.log(
-                    raw_df.loc[d_next, stk] /
-                    (raw_df.loc[d, stk] + 1e-9))
+                p0 = raw_df.loc[d, stk]
+                p1 = raw_df.loc[d_next, stk]
+                day_ret[stk] = (np.log(p1/p0)
+                                if p0 > 0 and p1 > 0 else 0.0)
             else:
                 day_ret[stk] = 0.0
 
-        shap_ret = sum(w[s] * day_ret[s] for s in PORTFOLIO_STOCKS)
-        eq_ret   = np.mean([day_ret[s] for s in PORTFOLIO_STOCKS])
-        nifty_ret = (np.log(raw_df["NIFTY50"].get(d_next, np.nan) /
-                            (raw_df["NIFTY50"].get(d, np.nan) + 1e-9))
-                     if d_next in raw_df.index and d in raw_df.index
-                     else 0.0)
+        shap_ret  = sum(w[s] * day_ret[s] for s in PORTFOLIO_STOCKS)
+        eq_ret    = np.mean([day_ret[s] for s in PORTFOLIO_STOCKS])
+        if d in raw_df.index and d_next in raw_df.index:
+            p0n = raw_df.loc[d, "NIFTY50"]
+            p1n = raw_df.loc[d_next, "NIFTY50"]
+            nifty_ret = (np.log(p1n/p0n)
+                         if p0n > 0 and p1n > 0 else 0.0)
+        else:
+            nifty_ret = 0.0
 
         port_records.append({
-            "date":       d_next,
-            "shap_ret":   shap_ret,
-            "eq_ret":     eq_ret,
-            "nifty_ret":  nifty_ret,
+            "date":      d_next,
+            "shap_ret":  shap_ret,
+            "eq_ret":    eq_ret,
+            "nifty_ret": nifty_ret,
         })
 
 port_df = (pd.DataFrame(port_records)
@@ -341,6 +361,13 @@ pm_nifty = portfolio_metrics(port_df["nifty_ret"], "NIFTY50 passive")
 port_summary = pd.DataFrame([pm_shap, pm_eq, pm_nifty])
 port_summary.to_csv("outputs/tables/table5_portfolio.csv", index=False)
 
+# Statistical test: is SHAP portfolio return > equal-weight?
+from evaluation import sharpe_t_test
+shap_arr = port_df["shap_ret"].values
+eq_arr   = port_df["eq_ret"].values
+t_stat, t_pval = sharpe_t_test(shap_arr, eq_arr)
+t_sig = "***" if t_pval<0.001 else "**" if t_pval<0.01 else "*" if t_pval<0.05 else "ns"
+
 print(f"  SHAP-guided  Sharpe={pm_shap['Sharpe']:.3f}  "
       f"Ann={pm_shap['Ann_Return']:.3f}  "
       f"MaxDD={pm_shap['MaxDrawdown']:.3f}")
@@ -349,6 +376,7 @@ print(f"  Equal-weight Sharpe={pm_eq['Sharpe']:.3f}  "
       f"MaxDD={pm_eq['MaxDrawdown']:.3f}")
 print(f"  NIFTY50 pass Sharpe={pm_nifty['Sharpe']:.3f}  "
       f"Ann={pm_nifty['Ann_Return']:.3f}")
+print(f"  Sharpe t-test (SHAP vs EW): t={t_stat:.3f}  p={t_pval:.4f}  {t_sig}")
 
 # ════════════════════════════════════════════════════════════════════
 # [9] PUBLICATION-QUALITY FIGURES  (8 figures for paper)
@@ -506,29 +534,56 @@ if not hm_data.empty and hm_data.values.size > 0:
 print("  ✓ Fig 5: SHAP regime heatmap")
 
 # ── Figure 6: Diebold-Mariano ─────────────────────────────────────
-fig, ax = plt.subplots(figsize=(7, 3.5))
-dm_plot = dm_df.copy()
-colors_dm = [REGIME_COLORS["bull"] if v < 0 else REGIME_COLORS["bear"]
-             for v in dm_plot["DM_stat"]]
-bars = ax.bar(dm_plot["XGBoost vs"], dm_plot["DM_stat"],
-              color=colors_dm, width=0.4)
-ax.axhline(0,    color="black", lw=0.7)
-ax.axhline(-1.96, color="gray", lw=0.8, ls="--", label="5% critical (±1.96)")
-ax.axhline(1.96,  color="gray", lw=0.8, ls="--")
-for bar, row in zip(bars, dm_plot.itertuples()):
-    ax.text(bar.get_x() + bar.get_width()/2,
-            bar.get_height() + 0.1*np.sign(bar.get_height()),
-            row.sig, ha="center", fontsize=13, fontweight="bold")
-ax.set_ylabel("DM Statistic", fontsize=9)
-ax.set_title("Figure 6: Diebold-Mariano Test\n"
-             "(Negative DM = XGBoost significantly outperforms baseline)",
-             fontsize=10, fontweight="bold")
-ax.legend(fontsize=8)
+fig, axes6 = plt.subplots(1, 2, figsize=(12, 4))
+dm_plot    = dm_df.copy()
+baselines  = dm_plot["XGBoost vs"].tolist()
+
+# Left panel: MSE-based DM
+dm_mse_vals = dm_plot["DM_MSE"].tolist()
+colors_mse  = [REGIME_COLORS["bull"] if v < 0 else REGIME_COLORS["bear"]
+               for v in dm_mse_vals]
+bars_mse = axes6[0].bar(baselines, dm_mse_vals, color=colors_mse, width=0.4)
+axes6[0].axhline(0,     color="black", lw=0.7)
+axes6[0].axhline(-1.96, color="gray",  lw=0.8, ls="--", label="±1.96 (5%)")
+axes6[0].axhline( 1.96, color="gray",  lw=0.8, ls="--")
+for bar, sig in zip(bars_mse, dm_plot["sig_MSE"].tolist()):
+    yoff = 0.05 if bar.get_height() >= 0 else -0.15
+    axes6[0].text(bar.get_x()+bar.get_width()/2,
+                  bar.get_height()+yoff, sig,
+                  ha="center", fontsize=12, fontweight="bold")
+axes6[0].set_ylabel("DM Statistic", fontsize=9)
+axes6[0].set_title("(a) MSE-based DM Test", fontsize=10, fontweight="bold")
+axes6[0].legend(fontsize=8)
+axes6[0].grid(True, axis="y", alpha=0.3)
+
+# Right panel: Directional accuracy DM
+dm_dir_vals = dm_plot["DM_Dir"].tolist()
+colors_dir  = [REGIME_COLORS["bull"] if v < 0 else REGIME_COLORS["bear"]
+               for v in dm_dir_vals]
+bars_dir = axes6[1].bar(baselines, dm_dir_vals, color=colors_dir, width=0.4)
+axes6[1].axhline(0,     color="black", lw=0.7)
+axes6[1].axhline(-1.96, color="gray",  lw=0.8, ls="--", label="±1.96 (5%)")
+axes6[1].axhline( 1.96, color="gray",  lw=0.8, ls="--")
+for bar, sig in zip(bars_dir, dm_plot["sig_Dir"].tolist()):
+    yoff = 0.05 if bar.get_height() >= 0 else -0.15
+    axes6[1].text(bar.get_x()+bar.get_width()/2,
+                  bar.get_height()+yoff, sig,
+                  ha="center", fontsize=12, fontweight="bold")
+axes6[1].set_ylabel("DM Statistic", fontsize=9)
+axes6[1].set_title("(b) Directional Accuracy DM Test",
+                   fontsize=10, fontweight="bold")
+axes6[1].legend(fontsize=8)
+axes6[1].grid(True, axis="y", alpha=0.3)
+
+fig.suptitle("Figure 6: Diebold-Mariano Tests — XGBoost vs Baselines\n"
+             "(Negative DM = XGBoost significantly outperforms)",
+             fontsize=11, fontweight="bold")
 fig.tight_layout()
 fig.savefig("outputs/figures/fig6_diebold_mariano.png",
             bbox_inches="tight", dpi=200)
 plt.close()
 print("  ✓ Fig 6: Diebold-Mariano test")
+
 
 # ── Figure 7: Portfolio Performance ──────────────────────────────
 fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
@@ -623,7 +678,8 @@ print(f"\n  SHAP-guided Sharpe   = {pm_shap['Sharpe']:.3f}")
 print(f"  Equal-weight Sharpe  = {pm_eq['Sharpe']:.3f}")
 print(f"  NIFTY50 pass Sharpe  = {pm_nifty['Sharpe']:.3f}")
 print(f"\n  DM tests significant (p<0.05): "
-      f"{(dm_df['p_value'] < 0.05).sum()}/{len(dm_df)}")
+      f"MSE={(dm_df['p_MSE']<0.05).sum() if 'p_MSE' in dm_df.columns else 0}/{len(dm_df)}  "
+      f"Directional={(dm_df['p_Dir']<0.05).sum() if 'p_Dir' in dm_df.columns else 0}/{len(dm_df)}")
 print(f"  RC-SHAP significant features: "
       f"{len(sig_feats)}/{len(rc_global.kw_results_)}")
 print(f"\n  Outputs → outputs/figures/  (8 PNGs)")

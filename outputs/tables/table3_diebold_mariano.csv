@@ -1,4 +1,4 @@
-XGBoost vs,DM_stat,p_value,sig,result
-ARIMA,0.6682,0.50428,ns,No significant difference
-Naive,0.5791,0.56276,ns,No significant difference
-Ridge,-1.633,0.10303,ns,XGBoost better
+XGBoost vs,DM_MSE,p_MSE,sig_MSE,DM_Dir,p_Dir,sig_Dir,DM_MAE,p_MAE
+ARIMA,0.6682,0.50428,ns,-0.3545,0.72309,ns,1.3812,0.16775
+Naive,0.5791,0.56276,ns,-27.045,0.0,***,1.1438,0.25319
+Ridge,-1.633,0.10303,ns,0.0,1.0,ns,-1.7103,0.08776

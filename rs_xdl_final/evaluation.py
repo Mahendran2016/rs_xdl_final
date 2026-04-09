@@ -102,3 +102,52 @@ def aggregate_folds(fold_metrics: list) -> pd.DataFrame:
     return df.groupby("model")[
         ["RMSE", "MAE", "R2", "DirAcc", "Sharpe"]
     ].agg(["mean", "std"]).round(4)
+
+
+def diebold_mariano_directional(y_true, f1, f2):
+    """DM test on directional accuracy loss — more powerful than MSE
+    for financial forecasting where direction matters more than magnitude."""
+    L1  = (np.sign(y_true) != np.sign(f1)).astype(float)
+    L2  = (np.sign(y_true) != np.sign(f2)).astype(float)
+    d   = L1 - L2
+    n   = len(d)
+    d_bar   = d.mean()
+    gamma_0 = np.var(d, ddof=1)
+    lrv     = max(gamma_0, 1e-12)
+    dm      = d_bar / np.sqrt(lrv / n)
+    p_val   = 2 * (1 - stats.t.cdf(abs(dm), df=n - 1))
+    return round(dm, 4), round(p_val, 5)
+
+
+def sharpe_t_test(returns1, returns2):
+    """Paired t-test: does strategy 1 generate significantly higher returns?"""
+    diff  = np.asarray(returns1) - np.asarray(returns2)
+    t, p  = stats.ttest_1samp(diff, 0)
+    return round(float(t), 4), round(float(p), 5)
+
+
+def dm_test_suite_full(y_true, preds_dict: dict, proposed: str) -> pd.DataFrame:
+    """Full DM suite: MSE, MAE, and Directional loss DM tests."""
+    if proposed not in preds_dict:
+        raise ValueError(f"{proposed} not in preds_dict")
+    rows = []
+    for name, preds in preds_dict.items():
+        if name == proposed:
+            continue
+        dm_mse, p_mse = diebold_mariano(y_true, preds_dict[proposed],
+                                         preds, criterion="MSE")
+        dm_dir, p_dir = diebold_mariano_directional(y_true,
+                                                      preds_dict[proposed], preds)
+        dm_mae, p_mae = diebold_mariano(y_true, preds_dict[proposed],
+                                         preds, criterion="MAE")
+        sig_mse = ("***" if p_mse<0.001 else "**" if p_mse<0.01
+                   else "*" if p_mse<0.05 else "ns")
+        sig_dir = ("***" if p_dir<0.001 else "**" if p_dir<0.01
+                   else "*" if p_dir<0.05 else "ns")
+        rows.append({
+            f"{proposed} vs": name,
+            "DM_MSE": dm_mse, "p_MSE": p_mse, "sig_MSE": sig_mse,
+            "DM_Dir": dm_dir, "p_Dir": p_dir, "sig_Dir": sig_dir,
+            "DM_MAE": dm_mae, "p_MAE": p_mae,
+        })
+    return pd.DataFrame(rows)

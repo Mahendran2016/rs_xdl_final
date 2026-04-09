@@ -103,74 +103,44 @@ class RCShap:
             "feature": self.feature_names, "Phi_j": phi
         }).sort_values("Phi_j", ascending=False).reset_index(drop=True)
         return self
-    
+
+    # ── Step 2: Kruskal-Wallis test ──────────────────────────────
     def kruskal_wallis_test(self) -> pd.DataFrame:
         """
-        Test H0: SHAP distributions equal across regimes.
+        Test H_0: SHAP distributions equal across regimes.
         Returns DataFrame with H, p-value, significance per feature.
         """
-
-        import pandas as pd
-        from scipy import stats
-
         results = []
-
-        # 🔍 Debug info (keep for now)
-        print("SHAP shape:", self.shap_values_.shape)
-        print("Regime counts:\n", pd.Series(self._rl).value_counts())
-
         for feat in self.feature_names:
-            fi = self.feature_names.index(feat)
-            groups = []
-
+            fi     = self.feature_names.index(feat)
+            groups = {}
             for reg in REGIMES:
                 mask = self._rl == reg
-                vals = self.shap_values_[mask, fi]
-
-                # ✅ Ensure enough samples + no NaN
-                vals = vals[~pd.isna(vals)]
-
-                if len(vals) >= 5:
-                    groups.append(vals)
-
-            # ✅ Need at least 2 valid groups
+                if mask.sum() >= 5:
+                    groups[reg] = self.shap_values_[mask, fi]
             if len(groups) >= 2:
                 try:
-                    H, p = stats.kruskal(*groups)
-
-                    sig = (
-                        "***" if p < 0.001 else
-                        "**"  if p < 0.01  else
-                        "*"   if p < 0.05  else "ns"
-                    )
-
+                    H, p = stats.kruskal(*groups.values())
+                    sig  = ("***" if p < 0.001 else
+                            "**"  if p < 0.01  else
+                            "*"   if p < 0.05  else "ns")
                     results.append({
-                        "feature": feat,
-                        "H_stat": round(H, 3),
-                        "p_value": round(p, 5),
-                        "sig": sig,
+                        "feature": feat, "H_stat": round(H, 3),
+                        "p_value": round(p, 5), "sig": sig,
                     })
-
-                except Exception as e:
-                    print(f"Skipping {feat}: {e}")
-
-        # ✅ CRITICAL FIX
-        if len(results) == 0:
-            print("⚠️ No valid Kruskal-Wallis results generated")
+                except Exception:
+                    pass
+        if results:
+            self.kw_results_ = (pd.DataFrame(results)
+                                 .sort_values("H_stat", ascending=False)
+                                 .reset_index(drop=True))
+        else:
+            # Not enough regime diversity in this fold — return empty
+            print("  ⚠️  KW test skipped: fewer than 2 regimes with n≥5 in sample")
             self.kw_results_ = pd.DataFrame(
-                columns=["feature", "H_stat", "p_value", "sig"]
-            )
-            return self.kw_results_
-
-        df = pd.DataFrame(results)
-
-        self.kw_results_ = (
-            df.sort_values("H_stat", ascending=False)
-            .reset_index(drop=True)
-        )
-
+                columns=["feature", "H_stat", "p_value", "sig"])
         return self.kw_results_
-    
+
     # ── Helpers ───────────────────────────────────────────────────
     def top_features(self, regime: str, n: int = 10) -> pd.DataFrame:
         return self.regime_shap_.get(regime, pd.DataFrame()).head(n)
@@ -195,6 +165,10 @@ class RCShap:
     def significant_features(self, alpha: float = 0.05) -> pd.DataFrame:
         if self.kw_results_ is None:
             self.kruskal_wallis_test()
+        if self.kw_results_ is None or self.kw_results_.empty:
+            return pd.DataFrame(columns=["feature","H_stat","p_value","sig"])
+        if "p_value" not in self.kw_results_.columns:
+            return pd.DataFrame(columns=["feature","H_stat","p_value","sig"])
         return self.kw_results_[self.kw_results_["p_value"] < alpha]
 
     def print_summary(self):
