@@ -1,0 +1,4 @@
+strategy,Ann_Return,Ann_Vol,Sharpe,MaxDrawdown,Calmar
+SHAP-guided,0.0073,0.1607,0.046,-0.1716,0.043
+Equal-weight,0.1161,0.1374,0.845,-0.1029,1.128
+NIFTY50 passive,0.1324,0.1229,1.077,-0.1104,1.2
